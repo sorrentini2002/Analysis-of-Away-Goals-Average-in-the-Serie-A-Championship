@@ -1,0 +1,1652 @@
+---
+title: "Analysis of Away Goals Average in the Serie A Championship"
+author: "Matteo Sorrentini"
+output:
+  html_document:
+    mathjax: "default"
+  word_document: default
+  pdf_document: default
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+	echo = TRUE,
+	message = FALSE,
+	warning = FALSE
+)
+library(tidyverse)    # Data manipulation e visualizzazione (ggplot2 incluso)
+library(dplyr)        # Manipolazione dati
+library(ggplot2)      # Visualizzazioni avanzate
+library(patchwork)    # Combinazione grafici ggplot2
+library(ggdist)       # Visualizzazioni di distribuzioni bayesiane
+library(moments)      # Statistiche di forma (skewness, kurtosis)
+library(fitdistrplus) # Fit distribuzioni
+library(MASS)         # Funzioni statistiche, fit distribuzioni
+library(goftest)      # Test di bontà di adattamento
+library(R2jags)       # Interfaccia per JAGS
+library(rjags)        # JAGS in R
+library(coda)         # Diagnostica catene MCMC
+library(MCMCvis)      # Visualizzazione risultati MCMC
+library(bayesplot)    # Grafici diagnostici per modelli bayesiani
+library(bridgesampling) # Stima della verosimiglianza marginale (Bayes factor)
+```
+
+Football analytics has transformed how we understand team performance, with away goals representing one of the most strategically significant metrics in modern football.
+This project presents a comprehensive Bayesian analysis of away goals performance in Italy's Serie A championship, leveraging 17 seasons of match data (1993/1994 to 2015/2016) to uncover fundamental patterns in offensive performance during away matches.
+
+## Context and Motivation
+
+The ability to score away from home is a critical determinant of success in elite football competitions.
+Serie A's reputation for tactical complexity and defensive solidity makes it an ideal laboratory for studying away performance dynamics.
+By focusing specifically on away goals - a metric that eliminates home advantage effects - we gain clearer insights into teams' inherent offensive capabilities under challenging conditions.
+
+## Analytical Approach
+
+Our investigation employs a rigorous Bayesian framework to model the average away goals per match:\
+- **Statistical Foundation**: We establish the Gamma distribution as the optimal parametric model for this positive, right-skewed variable through extensive exploratory analysis and goodness-of-fit testing\
+- **Bayesian Inference**: Using JAGS for MCMC sampling, we implement a mean-precision parametrized Gamma model with weakly informative priors derived from maximum likelihood estimates\
+- **Robust Validation**: Convergence diagnostics (Gelman-Rubin, trace plots, ESS), parameter recovery simulations, and frequentist comparisons ensure methodological rigor\
+- **Model Comparison**: We formally contrast Gamma and Log-Normal alternatives using DIC and Bayes factors to justify distributional choice
+
+## Key Objectives
+
+1.  Quantify the fundamental characteristics of away scoring in Serie A through posterior distributions of mean, variance, and precision parameters\
+2.  Assess temporal stability of away performance across seasons\
+3.  Establish a statistically robust framework for team performance evaluation\
+4.  Compare Bayesian and frequentist inferences for sports analytics applications
+
+## Report Structure
+
+1.  **Dataset Illustration**: Construction of the key metric, exploratory analysis, and distributional assessment\
+2.  **Statistical Modeling**: Bayesian specification, prior selection, and inferential goals\
+3.  **Main Findings**: Posterior estimates, hypothesis testing, and prior-posterior comparison\
+4.  **Model Comparison**: Formal comparison of Gamma and Log-Normal alternatives\
+5.  **Validation**: MCMC diagnostics, parameter recovery, and frequentist benchmarking
+
+This analysis moves beyond descriptive statistics to provide a probabilistic framework for understanding away performance in elite football.
+By quantifying uncertainty through posterior distributions rather than point estimates alone, we offer team analysts and sports researchers a more nuanced toolkit for performance evaluation in competitive environments.
+
+# 1. Illustration of the Dataset
+
+This section explores the `serieA` dataset, focusing on the offensive performance of teams in away matches.
+We construct the key variable `Away Goals Per Match`, calculated as the average number of goals scored away per team-season, and exclude the 2016/2017 season due to anomalies.
+
+An exploratory analysis follows, examining the distribution and temporal trends of the variable.
+Summary statistics, visualizations, and goodness-of-fit tests suggest that both the Gamma and Log-Normal distributions are reasonable modeling choices.
+These insights inform the statistical modeling developed in the next section.
+
+## 1.1 Structure and Composition of the Dataset
+
+The dataset has the following structure:
+
+-   **Season**: identifier of the football season (format "YYYY/YYYY+1")\
+-   **HomeTeam**: name of the team playing at home\
+-   **AwayTeam**: name of the team playing away\
+-   **FTHG**: number of goals scored by the home team at full time\
+-   **FTAG**: number of goals scored by the away team at full time
+
+```{r}
+# Load the data
+load("serieA.RData")
+data <- serieA
+
+# Dataset structure
+str(data)
+head(data, 10)
+
+# Overview of available seasons
+table(data$Season)
+
+# Total number of matches per season
+data %>% 
+  group_by(Season) %>% 
+  summarise(n_partite = n()) %>%
+  arrange(Season)
+```
+
+The 2016/2017 season has been excluded from the analysis due to concerns about potential noise and outliers that could distort the results.
+During that season, certain teams played away matches predominantly against weaker opponents in the first half of the campaign, which may have artificially inflated their average away goals.
+Such irregularities can introduce bias and reduce the reliability of the model’s estimates.
+
+```{r}
+data <- data %>%
+  filter(Season != "2016/2017")
+```
+
+## 1.2 Construction of the Variable of Interest
+
+The variable of interest `AwayGoalsPerMatch` represents the seasonal average of goals scored away from home by each team per match.
+This methodological choice is motivated by several considerations:
+
+-   **Temporal normalization**: allows comparison between seasons with a different number of matches\
+-   **Team standardization**: each team plays a fixed number of away matches per season\
+-   **Interpretability**: the metric is easily interpretable in football terms
+
+To compute this variable, for each combination of `Season` and `AwayTeam`, we sum the number of away goals scored (`FTAG`) and divide it by the number of away matches played (i.e., the number of times the team appears as `AwayTeam` during the season).
+
+$\text{Away Goals Per Match} = \frac{\text{Total Away Goals Scored in a Season}}{\text{Number of Away Matches Played}}$
+
+The result is a new dataset with one row per `(Season, Team)` pair, containing the variable `AwayScoringRate`.
+
+```{r message=FALSE, warning=FALSE}
+# Calculation of the variable of interest
+away_goals_data <- data %>%
+  group_by(Season, AwayTeam) %>%
+  summarise(
+    total_away_goals = sum(FTAG),
+    away_matches = n(),
+    .groups = 'drop'
+  ) %>%
+  mutate(
+    AwayGoalsPerMatch = total_away_goals / away_matches
+  )
+
+# Check the structure of the transformed data
+head(away_goals_data)
+dim(away_goals_data)
+
+# Descriptive statistics by season
+away_goals_data %>%
+  group_by(Season) %>%
+  summarise(
+    n_teams = n(),
+    mean_away_goals = round(mean(AwayGoalsPerMatch), 3),
+    median_away_goals = round(median(AwayGoalsPerMatch), 3),
+    std_dev = round(sd(AwayGoalsPerMatch), 3),
+    min_away_goals = round(min(AwayGoalsPerMatch), 3),
+    max_away_goals = round(max(AwayGoalsPerMatch), 3)
+  ) %>%
+  print(n = Inf)
+```
+
+## 1.3 Exploratory Analysis
+
+The exploratory analysis reveals the distributional characteristics of the variable of interest and its temporal evolution.
+
+```{r}
+# Overall distribution of the variable
+summary(away_goals_data$AwayGoalsPerMatch)
+```
+
+The summary statistics of the variable `AwayGoalsPerMatch` show that the minimum average away goals scored per match is approximately 0.24, while the maximum reaches just above 2.
+The median value is around 1.05, indicating that half of the team-season observations score more than one goal per away match.
+The mean (1.08) is slightly higher than the median, suggesting a slight positive skew in the distribution.
+The interquartile range spans from about 0.84 (25th percentile) to 1.29 (75th percentile), reflecting moderate variability in away scoring performance across teams and seasons.
+
+```{r}
+# Deep dive
+cat("\nStandard deviation:", sd(away_goals_data$AwayGoalsPerMatch))
+```
+
+The standard deviation of `AwayGoalsPerMatch` is approximately 0.34, indicating a moderate variability in the average number of goals scored away per match among teams and seasons.
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+
+# Histogram of the overall distribution
+# Calculate scaling factor for resizing
+scaling_factor <- nrow(away_goals_data) * 
+  (max(away_goals_data$AwayGoalsPerMatch) - min(away_goals_data$AwayGoalsPerMatch)) / 20
+
+# Corrected plot
+# Calculate quartiles
+quartiles <- quantile(away_goals_data$AwayGoalsPerMatch, probs = c(0.25, 0.5, 0.75))
+
+# Histogram + density + quartile lines
+p1 <- ggplot(away_goals_data, aes(x = AwayGoalsPerMatch)) +
+  geom_histogram(bins = 15, fill = "lightblue", color = "black", alpha = 0.7) +
+  geom_density(aes(y = ..density.. * scaling_factor), color = "red", size = 1) +
+  geom_vline(xintercept = quartiles, linetype = "dashed", color = c("blue", "darkgreen", "darkred"), size = 1) +
+  annotate("text", x = quartiles, y = Inf, label = c("Q1", "Median", "Q3"),
+           vjust = -0.5, hjust = 1.1, angle = 90, size = 3.5, color = c("blue", "darkgreen", "darkred")) +
+  labs(title = "Distribution of Average Away Goals Per Match",
+       x = "Away Goals Per Match",
+       y = "Frequency") +
+  theme_minimal()
+
+# Boxplot by season
+p2 <- ggplot(away_goals_data, aes(x = Season, y = AwayGoalsPerMatch)) +
+  geom_boxplot(fill = "lightgreen", alpha = 0.7) +
+  labs(title = "Seasonal Distribution of Average Away Goals",
+       x = "Season",
+       y = "Away Goals Per Match") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p1)
+
+```
+
+The plot shows the distribution of away goals per match, with the histogram representing the observed data and the red curve showing the fitted theoretical distribution.
+The average is around 1 goal per match.
+The 95% confidence interval highlights the precision of the mean estimate.
+
+```{r,echo = FALSE}
+print(p2)
+```
+
+The graph shows the distribution of the average away goals per match, divided by sports season.
+Each bar represents a confidence interval (likely 95%) around the mean calculated for each season, while the black dots indicate the observed outliers.
+The overall trend suggests a certain stability in the average number of away goals scored per match over the years.
+The means fluctuate slightly from season to season, but remain within reasonably narrow ranges, indicating that offensive performance on the road has been relatively consistent over time.
+Some seasons show outlier values or greater deviations compared to others , as highlighted by the longer vertical bars (confidence intervals) and extreme points.
+This may reflect specific changes in the league's dynamics, such as rule modifications, evolving playing styles, or exceptional events that influenced the statistics.
+
+## 1.4 Distribution Analysis
+
+The variable `AwayGoalsPerMatch` represents the seasonal average of away goals scored per team, derived from the raw data of the Serie A championship.
+This continuous non-negative metric (≥ 0) requires modeling using distributions appropriate to its nature.
+We present an exploratory analysis aimed at identifying the optimal theoretical distribution for subsequent Bayesian modeling.
+
+Start with a visual exploration of data distribution
+
+```{r,echo = FALSE}
+# Plot of empirical density for AwayGoalsPerMatch
+plot(density(away_goals_data$AwayGoalsPerMatch),
+     main = "Empirical Densities",
+     xlab = "Away Goals Per Match",
+     ylab = "Density",
+     col = "black",       # Line color
+     lwd = 2,             # Line width
+     lty = 1,             # Line type (solid)
+     xlim = c(0, max(away_goals_data$AwayGoalsPerMatch) + 0.5),  # X-axis limits
+     ylim = c(0, 1.5),    # Y-axis limits
+     panel.first = grid() # Add grid in the background
+)
+```
+
+The graph show the empirical density of away goals per match.
+The black line represents the empirical data, showing how frequently different numbers of away goals occur in matches.
+The distribution is right-skewed, peaking around 1 goal per match , indicating that most matches have fewer away goals, with fewer instances of higher scores.
+
+To quantify the observed asymmetry we proceed with the calculation of asymmetry and curtosis:
+
+```{r}
+# Calculation of skewness and kurtosis
+skewness_value <- skewness(away_goals_data$AwayGoalsPerMatch)
+kurtosis_value <- kurtosis(away_goals_data$AwayGoalsPerMatch)
+
+# Display skewness value
+cat("Skewness:", round(skewness_value, 3), "\n")
+# Indicates slight right-skewness
+cat("Kurtosis:", round(kurtosis_value, 3), "\n")
+# Provides information about the "tailedness" of the distribution
+```
+
+The distribution of `AwayGoalsPerMatch` shows a slight right skew (Skewness = 0.489) and a kurtosis close to that of a normal distribution (Kurtosis = 2.912), indicating moderately asymmetric data with light tails.
+
+To further assess whether the distribution of `AwayGoalsPerMatch` can be approximated by a normal distribution, we perform a Shapiro-Wilk test for normality.
+This test will help determine the appropriateness of using parametric models based on the normality assumption.
+
+```{r}
+shapiro_test <- shapiro.test(away_goals_data$AwayGoalsPerMatch)
+print(shapiro_test)
+```
+
+The Shapiro-Wilk test yields a W statistic of 0.9784 with a p-value of 4.216e-06, which is well below the typical significance level of 0.05.
+This indicates strong evidence against the null hypothesis of normality, suggesting that the AwayGoalsPerMatch variable is not normally distributed.
+To better visualize the deviation from normality, we include a Q-Q plot (`qqnorm`) which graphically compares the sample distribution of `AwayGoalsPerMatch` to a theoretical normal distribution.
+
+```{r}
+qqnorm(away_goals_data$AwayGoalsPerMatch)
+qqline(away_goals_data$AwayGoalsPerMatch, col = "red")
+```
+
+The QQ-Plot shows that the data deviate from normality, particularly in the tails.
+The points diverge from the red reference line at both ends, indicating heavier tails than expected under a normal distribution.
+This suggests non-normality in the dataset.
+To identify the most suitable theoretical distribution for modeling `AwayGoalsPerMatch`, we fit both a Gamma and a Log-Normal distribution to the empirical data.
+We then perform Kolmogorov–Smirnov (K-S) goodness-of-fit tests to evaluate how well each fitted distribution matches the observed data.
+
+```{r, warning=FALSE}
+# Fit a Gamma distribution to the data
+fit_gamma <- fitdist(away_goals_data$AwayGoalsPerMatch, "gamma")
+
+# Perform Kolmogorov-Smirnov test for Gamma fit
+ks_test_gamma <- ks.test(away_goals_data$AwayGoalsPerMatch, "pgamma", 
+                         shape = fit_gamma$estimate[1], rate = fit_gamma$estimate[2])
+print(ks_test_gamma)
+
+# Fit a Log-Normal distribution to the data
+fit_lnorm <- fitdist(away_goals_data$AwayGoalsPerMatch, "lnorm")
+
+# Perform Kolmogorov-Smirnov test for Log-Normal fit
+ks_test_lnorm <- ks.test(away_goals_data$AwayGoalsPerMatch, "plnorm", 
+                         meanlog = fit_lnorm$estimate[1], sdlog = fit_lnorm$estimate[2])
+print(ks_test_lnorm)
+```
+
+To identify a suitable theoretical model for the variable `AwayGoalsPerMatch`, we use the `fitdist()` function from the **fitdistrplus** package.
+This function estimates the parameters of a specified probability distribution that best fits the empirical data, using maximum likelihood estimation (MLE).
+
+In this analysis, we fit both a **Gamma** and a **Log-Normal** distribution, as these are appropriate for continuous and non-negative variables.
+To evaluate the goodness-of-fit, we apply the **Kolmogorov-Smirnov (K-S) test**, which compares the empirical distribution of the data to the cumulative distribution function (CDF) of the fitted model.
+
+The null hypothesis of the K-S test is that the data follow the specified distribution.
+A high p-value (\> 0.05) indicates that we do not reject the null hypothesis — meaning the theoretical distribution is a plausible model for the data.
+
+Both p-values are well above the conventional 0.05 threshold, suggesting that **neither the Gamma nor the Log-Normal distribution is significantly different from the empirical distribution**.
+This implies that both are reasonable candidates for modeling the variable `AwayGoalsPerMatch`, with the Gamma distribution slightly outperforming based on the lower D-statistic.
+
+The following plot compares the empirical density of the variable `AwayGoalsPerMatch` with the fitted Gamma and Log-Normal theoretical densities.
+This visual comparison helps assess which distribution better captures the data’s underlying pattern.
+
+```{r,echo = FALSE}
+
+# Improved visualization of empirical vs theoretical densities
+plot(density(away_goals_data$AwayGoalsPerMatch),
+     main = "Comparison of Empirical and Theoretical Densities",
+     xlab = "Away Goals per Match",
+     ylab = "Density",
+     col = "black",       # Empirical density in black
+     lwd = 2,
+     lty = 1,
+     xlim = c(0, max(away_goals_data$AwayGoalsPerMatch) + 0.5),
+     ylim = c(0, 1.5),
+     panel.first = grid())
+
+# Add fitted Gamma distribution density
+curve(dgamma(x,
+             shape = fit_gamma$estimate[1],
+             rate = fit_gamma$estimate[2]),
+      add = TRUE, col = "#1f77b4", lwd = 2, lty = 2)
+
+# Add fitted Log-Normal distribution density
+curve(dlnorm(x,
+             meanlog = fit_lnorm$estimate[1],
+             sdlog = fit_lnorm$estimate[2]),
+      add = TRUE, col = "#d62728", lwd = 2, lty = 3)
+
+# Add legend for clarity
+legend("topright",
+       legend = c("Empirical Density", "Gamma", "Log-Normal"),
+       col = c("black", "#1f77b4", "#d62728"),
+       lwd = 2,
+       lty = c(1, 2, 3),
+       bg = "white",
+       box.lty = 0)
+
+```
+
+Both theoretical distributions (Gamma in dashed blue and Log-Normal in dotted red) attempt to model this pattern but show slight differences in fit, particularly in the tails.
+This comparison helps assess which theoretical distribution better captures the characteristics of the observed data.
+
+The exploratory analysis highlights several important characteristics relevant for modeling:
+
+-   **Support**: the variable takes values in ℝ⁺, with a theoretical minimum of 0\
+-   **Skewness**: the distribution exhibits a slight positive skewness, typical of count-related variables with rare events\
+-   **Variability**: variability is observed both within seasons (between teams) and across different seasons\
+-   **Range**: values typically range between 0.5 and 2.5 away goals per match
+
+This initial examination of the dataset lays the groundwork for specifying a statistical model, indicating that positive continuous distributions—such as the Gamma distribution—are appropriate choices for modeling the variable `AwayGoalsPerMatch`.
+
+The subsequent step will involve the formal specification of the statistical model and the definition of the inferential goals for the analysis.
+
+# 2. Statistical Model Specification and Inferential Goals
+
+This section outlines a Bayesian model for `AwayGoalsPerMatch`, using a Gamma distribution based on its positive and skewed nature.
+We adopt a mean-precision parametrization for clarity, and set weakly informative priors derived from `fitdist` estimates.
+
+Our goal is to estimate model parameters, assess uncertainty, and validate the fit through standard Bayesian diagnostics.
+The model is implemented via JAGS using Metropolis-Hastings.
+
+## 2.1 Choice of the Statistical Model
+
+Based on the exploratory analysis conducted in the previous section, the variable `AwayGoalsPerMatch` exhibits characteristics that suggest the adoption of a Gamma distribution as an appropriate probabilistic model.
+This choice is motivated by several theoretical and empirical considerations:
+
+-   **Positive support**: the variable takes values in ℝ⁺, a fundamental requirement for the Gamma distribution\
+-   **Parametric flexibility**: the Gamma distribution can assume various shapes (exponential, chi-square, etc.) through its parameters\
+-   **Interpretability in context**: count events normalized as averages (such as goals per match) are naturally modeled by continuous positive distributions\
+-   **Positive skewness**: consistent with the typical shape of the Gamma distribution
+
+## 2.2 Model Formulation
+
+The variable of interest, `AwayGoalsPerMatch`, is continuous, positive, and exhibits positive skewness (as highlighted in Section 1).
+These characteristics suggest modeling the data using a Gamma distribution:
+
+$$
+AwayGoalsPerMatch_i \sim \text{Gamma}(\alpha, \beta),
+$$
+
+where $\alpha > 0$ is the shape parameter and $\beta > 0$ is the rate parameter.
+
+To facilitate interpretability, we adopt an equivalent parametrization in terms of the mean $\mu$ and the precision $\nu$:
+
+$$
+AwayGoalsPerMatch_i \sim \text{Gamma}(\mu, \nu),
+$$
+
+with $\mu = \frac{\alpha}{\beta}$ representing the mean, and $\nu = \alpha$ representing the precision.
+The variance is then given by $\sigma^2 = \frac{\mu^2}{\nu}$.
+
+The likelihood function for the observed data $y = \{y_1, y_2, \ldots, y_n\}$ given parameters $\mu$ and $\nu$ is:
+
+$$
+p(y \mid \mu, \nu) = \prod_{i=1}^n \frac{\left( \frac{\nu}{\mu} \right)^{\nu}}{\Gamma(\nu)} y_i^{\nu - 1} \exp\left( - \frac{\nu}{\mu} y_i \right)
+$$
+
+-   $\mu$: the global average number of away goals scored per match across all teams and seasons.\
+-   $\nu$: controls the variability around $\mu$. Higher values of $\nu$ indicate that teams have more similar performances, while lower values imply greater heterogeneity.
+
+This parametrization allows direct interpretation of $\mu$ as the expected number of goals and $\nu$ as a measure of data concentration around the mean.
+To ensure flexibility and minimize subjective influence, we assign non-informative priors to the parameters.
+
+## 2.3 Prior Specification Based on fitdist Estimates
+
+To set informative priors for the parameters $\mu$ (mean) and $\nu$ (precision) of the Gamma model, we leverage the expected value and variance of the observed data $y$.
+
+Using the `fitdist` function from the `fitdistrplus` R package, we fit a Gamma distribution to the observed data $y$.
+This procedure provides maximum likelihood estimates for the shape $\hat{\alpha}$ and rate $\hat{\beta}$ parameters of the Gamma distribution, which summarize the data’s distributional characteristics.
+
+$$
+\mathbb{E}[y] = \frac{\hat{\alpha}}{\hat{\beta}},
+\quad
+\mathrm{Var}[y] = \frac{\hat{\alpha}}{\hat{\beta}^2}.
+$$
+
+From these, we calculate:
+
+$$
+\hat{\nu} = \hat{\alpha} \quad \text{(shape estimated by fitdist)},
+\quad
+\hat{\mu} = \frac{\hat{\alpha}}{\hat{\beta}} \quad \text{(mean estimated by fitdist)}.
+$$
+
+Using these estimates, we construct Gamma priors for $\mu$ and $\nu$:
+
+$$
+\mu \sim \text{Gamma}(a_\mu, b_\mu), \quad \text{with} \quad b_\mu = \frac{a_\mu}{\hat{\mu}},
+$$
+
+Similarly for $\nu$:
+
+$$
+\nu \sim \text{Gamma}(a_\nu, b_\nu), \quad \text{with} \quad b_\nu = \frac{a_\nu}{\hat{\nu}} = \frac{a_\nu}{\hat{\alpha}},
+$$
+
+To ensure flexibility and minimize subjective influence, we ultimately select non-informative priors by choosing relatively small values for $a_\mu$ and $a_\nu$.
+
+Specifically, we set the shape hyperparameters as $a_\mu = 1.5$ and $a_\nu = 2$, while the corresponding rate hyperparameters were set to $b_\mu = 1.38637$ and $b_\nu = 0.204551$, respectively.
+
+To better understand the shape of these prior distributions, we proceed by plotting their respective densities.
+
+```{r}
+alpha_hat <- fit_gamma$estimate["shape"]
+beta_hat <- fit_gamma$estimate["rate"]
+
+
+mu_hat <- alpha_hat / beta_hat
+nu_hat <- alpha_hat
+
+a_mu <- 1.5
+b_mu <- a_mu / mu_hat
+
+a_nu <- 2
+b_nu <- a_nu / nu_hat
+```
+
+```{r, echo=FALSE}
+
+mu_grid <- seq(0.1, 3, length.out = 1000)
+nu_grid <- seq(0.1, 25, length.out = 1000)
+
+par(mfrow = c(1, 2))
+
+# Prior for μ
+plot(mu_grid, dgamma(mu_grid, a_mu, b_mu), 
+     type = "l", lwd = 2, col = "darkgreen",
+     xlab = "μ", ylab = "Density",
+     main = "Prior Distribution for μ")
+
+# Prior for ν
+plot(nu_grid, dgamma(nu_grid, a_nu, b_nu), 
+     type = "l", lwd = 2, col = "purple",
+     xlab = "ν", ylab = "Density", 
+     main = "Prior Distribution for ν")
+
+par(mfrow = c(1, 1))
+```
+
+## 2.4 Inferential Goal
+
+The Bayesian analysis aims to address the following inferential questions:
+
+-   Bayesian Point Estimates.
+-   Credible intervals: Equal-tailed intervals and Highest Posterior Density (HPD) methods.
+-   Prior vs Posterior Comparison.
+-   Model Comparision by DIC metric.
+-   Diagnostic by Gelman-Rubin, Trace plot and other.
+-   Model Validation Through Parameter Recovery via Simulation.
+-   Comparative Analysis with Frequentist Inference.
+
+------------------------------------------------------------------------
+
+## 2.5 Computational Implementation
+
+The model will be implemented using the Metropolis-Hastings algorithm via **JAGS** (Just Another Gibbs Sampler):
+
+```{r}
+# JAGS model specification (parameterized by mean and precision)
+model_string <- "
+model {
+  for (i in 1:n) {
+    y[i] ~ dgamma(nu, nu / mu)
+  }
+
+  # Priors
+  mu ~ dgamma(a_mu, b_mu)
+  nu ~ dgamma(a_nu, b_nu)
+
+  # Derived quantities
+  sigma2 <- pow(mu, 2) / nu      # Variance
+  cv <- 1 / sqrt(nu)             # Coefficient of variation
+  y_pred ~ dgamma(nu, nu / mu)   # Posterior predictive
+}
+"
+```
+
+The complete model specification thus provides a solid theoretical framework for Bayesian analysis of the variable of interest, balancing model flexibility with result interpretability.
+The next step will consist of computational implementation and evaluation of the obtained inferential results.
+
+# 3 Main Inferential Findings
+
+# 3 Main Inferential Findings
+
+This section presents the core outcomes of the Bayesian inference applied to the Gamma model introduced earlier.
+Using MCMC simulation via **JAGS** and the `R2jags` package, we estimated the posterior distributions of key parameters such as the mean, variance, precision, and coefficient of variation of away goals per match.
+
+The results include point and interval estimates, posterior density plots, and hypothesis testing to evaluate how well the data supports specific values or model simplifications.
+A comparison between prior and posterior distributions further illustrates the learning achieved from the observed data.
+
+## 3.1 MCMC Estimation
+
+The implementation of the Gamma model specified in the previous section was carried out using **JAGS** via the `R2jags` interface.
+Below is the complete code used for the analysis:
+
+```{r, results='hide'}
+# Data to be passed to JAGS
+jags_data <- list(
+  y = away_goals_data$AwayGoalsPerMatch,
+  n = nrow(away_goals_data),
+  a_mu = a_mu,
+  b_mu = b_mu,
+  a_nu = a_nu,
+  b_nu = b_nu
+)
+
+# Parameters to monitor
+parameters <- c("mu", "nu", "sigma2", "cv")
+
+# MCMC execution
+jags_fit <- jags(
+  data = jags_data,
+  parameters.to.save = parameters,
+  model.file = textConnection(model_string),
+  n.chains = 3,       # Number of independent MCMC chains
+  n.iter = 15000,     # Total number of iterations per chain
+  n.burnin = 5000,    # Number of initial iterations to discard (burn-in)
+  n.thin = 2          # Thinning factor: keep 1 sample every 2
+)
+```
+
+After running the simulation, several elements are extracted and used in the subsequent analysis:
+
+```{r}
+# Extract MCMC samples
+mcmc_samples <- as.mcmc(jags_fit)
+mcmc_matrix <- as.matrix(mcmc_samples)
+
+# Posterior means
+posterior_means <- jags_fit$BUGSoutput$mean
+
+# Prepare credible interval output
+ci_results <- data.frame(
+  Parameter = parameters,
+  Lower_95 = numeric(length(parameters)),
+  Upper_95 = numeric(length(parameters)),
+  Width = numeric(length(parameters))
+)
+
+# Posterior draws
+nu_posterior <- as.numeric(mcmc_matrix[, "nu"])
+nu_df <- data.frame(nu = nu_posterior)
+
+mu_posterior <- as.numeric(mcmc_matrix[, "mu"])
+mu_df <- data.frame(mu = mu_posterior)
+
+mu_samples <- mcmc_matrix[,"mu"]
+nu_samples <- mcmc_matrix[, "nu"]
+```
+
+## 3.2 Bayesian Point Estimates
+
+The posterior Bayesian estimation produced the following point estimates:
+
+```{r,echo=FALSE}
+cat("μ (population mean):", round(posterior_means$mu, 3), "\n")
+cat("ν (precision / shape):", round(posterior_means$nu, 3), "\n")
+cat("σ² (population variance):", round(posterior_means$sigma2, 3), "\n")
+cat("CV (coefficient of variation):", round(posterior_means$cv, 3), "\n")
+```
+
+These estimates yield several insights:
+
+-   $\mu$ (Population Mean): The posterior mean of away goals per match is estimated to be approximately **1.08**.
+    This represents the expected number of goals scored away by a team in a typical match across the dataset.
+
+-   $\nu$ (Precision / Shape): The estimated precision is approximately **9.76**, indicating a moderate level of homogeneity among teams.
+    Higher values of $\nu$ suggest that the distribution of away goals is tightly concentrated around the mean; here, the level of dispersion is moderate.
+
+-   **σ² (Population Variance)**: The estimated variance is **0.121**, confirming the moderate variability in away goals per game.
+    This aligns with the interpretation of $\nu$ and suggests a reasonable consistency in scoring behavior among teams.
+
+-   **CV (Coefficient of Variation)**: The CV is estimated to be **0.321**, suggesting that the relative dispersion (standard deviation over mean) is around **32%**.
+    This moderate value supports the assumption that the Gamma distribution is a good fit: the distribution is positively skewed but not excessively dispersed.
+
+Together, these results indicate that the Gamma model appropriately captures the structure of the data, with clear interpretability of the key parameters in terms of scoring dynamics in away matches.
+
+## 3.3 Interval Estimates
+
+The 95% credible intervals were computed both using quantiles (equal-tailed intervals) and Highest Posterior Density (HPD) methods, providing a quantification of the uncertainty associated with the parameter estimates.
+
+Equal-tailed credible intervals include the central portion of the posterior distribution such that the probability excluded from both tails is equal.
+They are straightforward to compute and interpret but may not always capture the shortest interval containing the bulk of the posterior mass.
+
+HPD intervals, on the other hand, represent the narrowest interval containing the specified posterior probability (e.g., 95%).
+This makes HPD intervals especially useful when the posterior distributions are skewed or multimodal, as they better reflect the regions of highest posterior density.
+
+In practice, when posterior distributions are symmetric and unimodal, both intervals tend to coincide closely.
+Differences between them become more relevant when dealing with asymmetric or complex posterior shapes.
+
+```{r}
+# Function to calculate equal-tailed credible intervals
+credible_intervals <- function(x, prob = 0.95) {
+  alpha_level <- 1 - prob
+  quantiles <- quantile(x, c(alpha_level/2, 1 - alpha_level/2))
+  return(quantiles)
+}
+
+# Calculate equal-tailed credible intervals for all monitored parameters
+for(i in seq_along(parameters)) {
+  ci <- credible_intervals(mcmc_matrix[, parameters[i]])
+  ci_results[i, 2:3] <- ci
+  ci_results[i, 4] <- ci[2] - ci[1]  # Interval width
+}
+```
+
+```{r, echo=FALSE}
+print(ci_results)
+```
+
+The 95% credible intervals provide valuable insights into the parameters of our Gamma model.
+The mean parameter $\mu$, representing the average number of away goals per match, is estimated with high precision, lying between approximately 1.05 and 1.12.
+This indicates strong certainty about the typical scoring rate.
+
+The precision parameter $\nu$, which inversely relates to the variance, shows a wider interval (roughly 8.5 to 11.1), suggesting some moderate uncertainty about the variability of performances across teams.
+Nonetheless, the values indicate a relatively consistent pattern in scoring.
+
+The population variance $\sigma^2$ is narrowly estimated between 0.10 and 0.14, confirming limited variability in the data.
+Finally, the coefficient of variation (CV) falls between 0.30 and 0.34, showing moderate relative dispersion around the mean.
+
+Overall, these intervals demonstrate that the model provides reliable and precise estimates, especially for the mean and relative variability, supporting the appropriateness of the Gamma model for this data.
+
+```{r}
+# Calculate Highest Posterior Density (HPD) intervals at 95% probability
+HPDinterval(mcmc_samples, prob = 0.95)
+```
+
+The HPD (Highest Posterior Density) intervals computed for the parameters are very similar to the previously calculated equal-tailed credible intervals.
+Both sets of intervals for $\mu$, $\nu$, $\sigma^2$, and the coefficient of variation (CV) are nearly overlapping, indicating strong agreement between the two methods.
+
+Slight differences arise because HPD intervals focus on the narrowest interval containing 95% of the posterior mass, while equal-tailed intervals split the excluded probability equally on both tails.
+As a result, HPD intervals can be marginally tighter and may better reflect the true shape of asymmetric posterior distributions.
+
+Overall, the consistency between these intervals reinforces the robustness of the Bayesian estimates, confirming that the inferences about the mean scoring rate, precision, variance, and variation are stable regardless of the credible interval computation method used.
+
+To complement the numerical summaries of the credible intervals, the following density plots illustrate the posterior distributions of the parameters $\mu$ (mean away goals per match) and $\nu$ (precision).
+Each plot highlights the 95% equal-tailed credible intervals (dashed blue lines) and the posterior mean (solid red line), providing an intuitive visualization of the uncertainty around these estimates.
+
+```{r,echo=FALSE}
+# Posterior distribution plot for μ (mean)
+mu_lower <- ci_results[ci_results$Parameter == "mu", "Lower_95"]
+mu_upper <- ci_results[ci_results$Parameter == "mu", "Upper_95"]
+mu_mean <- mean(mcmc_matrix[, "mu"])
+
+ggplot(mu_df, aes(x = mu)) +
+  geom_density(fill = "skyblue", alpha = 0.6) +
+  geom_vline(xintercept = mu_lower, linetype = "dashed", color = "darkblue") +
+  geom_vline(xintercept = mu_upper, linetype = "dashed", color = "darkblue") +
+  geom_vline(xintercept = mu_mean, linetype = "solid", color = "red") +
+  annotate("text", x = mu_lower, y = 0, label = paste0("2.5%"),
+           vjust = -1.5, hjust = 0, color = "darkblue") +
+  annotate("text", x = mu_upper, y = 0, label = paste0("97.5%"),
+           vjust = -1.5, hjust = 1, color = "darkblue") +
+  annotate("text", x = mu_mean, y = 0, label = paste0("Mean"),
+           vjust = -1.5, hjust = 0.5, color = "red") +
+  labs(
+    title = "Posterior Distribution of μ",
+    x = "Mean Away Goals per Match",
+    y = "Density"
+  ) +
+  theme_minimal()
+```
+
+```{r,echo=FALSE}
+# Posterior distribution plot for ν (precision)
+nu_lower <- ci_results[ci_results$Parameter == "nu", "Lower_95"]
+nu_upper <- ci_results[ci_results$Parameter == "nu", "Upper_95"]
+nu_mean <- mean(mcmc_matrix[, "nu"])
+
+ggplot(data.frame(nu = mcmc_matrix[, "nu"]), aes(x = nu)) +
+  geom_density(fill = "skyblue", alpha = 0.6) +
+  geom_vline(xintercept = nu_lower, linetype = "dashed", color = "darkblue") +
+  geom_vline(xintercept = nu_upper, linetype = "dashed", color = "darkblue") +
+  geom_vline(xintercept = nu_mean, linetype = "solid", color = "red") +
+  annotate("text", x = nu_lower, y = 0, label = paste0("2.5%"),
+           vjust = -1.5, hjust = 0, color = "darkblue") +
+  annotate("text", x = nu_upper, y = 0, label = paste0("97.5%"),
+           vjust = -1.5, hjust = 1, color = "darkblue") +
+  annotate("text", x = nu_mean, y = 0, label = paste0("Mean"),
+           vjust = -1.5, hjust = 0.5, color = "red") +
+  labs(
+    title = "Posterior Distribution of ν (Precision)",
+    x = expression(nu),
+    y = "Density"
+  ) +
+  theme_minimal()
+```
+
+## 3.4 Bayesian Hypothesis Testing
+
+A Bayesian hypothesis test can be used to assess whether the posterior mean $\mu$ is statistically lower than a reference value, for example, to evaluate whether the model-based posterior inference aligns with the observed average from the 2024/2025 season.
+If the posterior probability that $\mu$ is close to (or greater/less than) 1.22 is high, the model can be considered consistent with the observed data.
+
+We test the following hypotheses:
+
+$$
+H_0: \mu \geq 1.22 \quad \text{vs} \quad H_1: \mu < 1.22
+$$
+
+The posterior probability of $H_0$ and of $H_1$ is computed as follows:
+
+```{r}
+prob_mu_greater_22 <- mean(mu_samples > 1.22)
+prob_mu_less_22 <- mean(mu_samples < 1.22)
+
+cat("P(μ > 1.22 | data) =", round(prob_mu_greater_22, 4), "\n")
+cat("P(μ < 1.22 | data) =", round(prob_mu_less_22, 4), "\n")
+```
+
+With a Bayes Factor given by:
+
+$$
+BF_{10} = \frac{P(\mu \leq 1.22 \mid \text{data})}{P(\mu > 1.22 \mid \text{data})}
+$$
+
+These results provide overwhelming evidence in favor of the alternative hypothesis $H_1: \mu < 1.22$.
+In fact, none of the posterior mass supports the null hypothesis $H_0: \mu \geq 1.22$, leading to a Bayes Factor $BF_{10} \to \infty$.
+This strongly suggests that the true mean number of away goals per match is lower than the observed league average of 1.22.
+
+Since the Gamma distribution with a shape parameter ($\nu$) equal to 1 corresponds to an Exponential distribution, we can test whether the data are compatible with such a simplification.
+Specifically, we examine two probabilities based on the posterior distribution of $\nu$:
+
+-   $P(\nu > 1 \mid \text{data})$: the probability that the shape parameter exceeds 1, suggesting deviation from exponential behavior.
+-   $P(0.9 \leq \nu \leq 1.1 \mid \text{data})$: the probability that the shape parameter lies approximately around 1, indicating potential compatibility with an exponential distribution.
+
+```{r}
+# Posterior tests related to exponentiality (shape ≈ 1)
+prob_nu_greater_1 <- mean(nu_samples > 1)
+prob_nu_equiv <- mean(nu_samples >= 0.9 & nu_samples <= 1.1)
+
+cat("P(nu > 1 | data) =", round(prob_nu_greater_1, 4), "\n")
+cat("P(0.9 ≤ nu ≤ 1.1 | data) =", round(prob_nu_equiv, 4), "\n")
+```
+
+These results strongly imply that the Gamma distribution used to model the data does not resemble an exponential distribution.
+Instead, the data support a more general Gamma shape with($\nu > 1$), which corresponds to a distribution with less skewness and more concentration around the mean than the exponential case.
+
+## 3.5 Prior vs Posterior Comparison
+
+To assess the learning achieved through Bayesian updating, a comparison between the prior and posterior distributions of the mean parameter $\mu$ is highly informative.
+This visual comparison helps understand how the observed data have influenced the beliefs about the average number of away goals per match.
+
+```{r warning=FALSE}
+# Create a comparison dataset with 1000 samples from the prior and posterior distributions
+comparison_df <- data.frame(
+  Distribution = rep(c("Prior", "Posterior"), each = 1000),
+  mu = c(
+    rgamma(1000, shape = a_mu, rate = b_mu),  # Prior samples
+    mu_samples  # Posterior samples
+  )
+)
+
+# Generate a density plot comparing prior and posterior distributions of μ
+ggplot(comparison_df, aes(x = mu, fill = Distribution)) +
+  geom_density(alpha = 0.6) +
+  geom_vline(xintercept = 1.0, linetype = "dashed") +  # Reference line for interpretation
+  labs(
+    title = "Prior vs Posterior Comparison for μ",
+    x = "Mean goals per match",
+    y = "Density"
+  ) +
+  scale_fill_manual(values = c("#E69F00", "#56B4E9")) +
+  xlim(1, 1.15) +
+  theme_minimal() 
+```
+
+Both distributions are centered around similar values, roughly between 1.05 and 1.10 goals per match, indicating that the initial prior beliefs were well aligned with the information provided by the observed data.
+
+However, the posterior distribution is noticeably narrower than the prior, which shows that the data has significantly reduced uncertainty about the parameter $\mu$.
+This tightening of the distribution suggests that the model has effectively learned from the data, leading to a more precise and confident estimate of the average goals per match.
+
+Moreover, the overlap between the prior and posterior distributions reveals that the prior was informative yet flexible enough to be updated by the data.
+The data have not only shifted the central tendency but also sharpened the distribution, reinforcing the evidence for the central value of $\mu$.
+
+Overall, this comparison highlights the strength of the Bayesian framework in combining prior knowledge with empirical data.
+It results in a refined understanding of the parameter of interest, capturing both the initial beliefs and the insights gained through the analysis.
+
+# 4 Alternative Statistical Model and Model Comparison
+
+To assess the robustness of our conclusions, we consider an alternative model based on the Log-Normal distribution.
+While the Gamma model performed well, the Log-Normal offers similar flexibility and interpretability, especially for positively skewed data.
+
+We implement this model using a Bayesian approach and compare it to the Gamma model through visual checks, summary estimates, and model selection criteria such as DIC and marginal likelihood.
+This comparison allows us to evaluate how sensitive our findings are to the choice of distribution and ultimately supports the validity of the Gamma model.
+
+## 4.1 Motivation for an Alternative Model
+
+Although the Gamma model showed a reasonable fit to the data, it is important to consider alternative models to assess the robustness of the inferential conclusions.
+The proposed alternative model is based on the Log-Normal distribution, motivated by the following considerations:
+
+-   Positive support: like the Gamma distribution, the Log-Normal is defined on ℝ⁺.
+-   Asymmetry: it can capture positive skewness through the logarithmic transformation.
+-   Interpretability: the logarithm of the variable follows a Normal distribution, facilitating interpretation.
+-   Flexibility: it can take on different shapes through the location and scale parameters.
+
+**Level 1 – Likelihood:**
+
+$$
+Y_i \sim \text{LogNormal}(\mu, \sigma^2) \quad \text{for } i = 1, \ldots, n
+$$
+
+equivalently:
+
+$$
+\log(Y_i) \sim \text{Normal}(\mu, \sigma^2)
+$$
+
+where:
+
+-   $\mu \in \mathbb{R}$ is the location parameter (mean of the logarithm),
+-   $\sigma^2 > 0$ is the scale parameter (variance of the logarithm).
+
+**Level 2 – Prior Distributions:**
+
+$$
+\mu \sim \text{Normal}(0, 1) \quad \text{(Weakly informative prior on the log-scale)}
+$$
+
+$$
+\sigma \sim \text{Gamma}(2, 0.2) \quad \text{(Consistent with the original Gamma model)}
+$$
+
+## 4.2 Implementation of Log-Normal Model
+
+```{r, warning=FALSE,results='hide'}
+model_code_ln <- "
+model {
+  # Likelihood: Log-Normal distribution for observed data
+  for (i in 1:n) {
+    y[i] ~ dlnorm(mu_log, tau)
+  }
+  
+  # Precision is the inverse of variance (on log scale)
+  tau <- 1 / pow(sigma, 2)
+  
+  # Priors for parameters
+  mu_log ~ dnorm(0, 1)        # Weakly informative prior on log-mean
+  sigma ~ dgamma(2.0, 0.2)    # Prior on standard deviation consistent with Gamma model
+  
+  # Derived quantities
+  mean_lognormal <- exp(mu_log + pow(sigma, 2) / 2)  # Mean on original scale
+  var_lognormal <- exp(2 * mu_log + pow(sigma, 2)) * (exp(pow(sigma, 2)) - 1)  # Variance on original scale
+  cv_lognormal <- sqrt(exp(pow(sigma, 2)) - 1)       # Coefficient of variation
+  
+  # Standard deviation on log scale
+  sigma_log <- 1 / sqrt(tau)
+}
+"
+
+fit_ln <- jags(
+  data = jags_data,
+  parameters.to.save = c("mu_log", "sigma", "sigma_log", "mean_lognormal", "var_lognormal", "cv_lognormal"),
+  model.file = textConnection(model_code_ln),
+  n.chains = 3,
+  n.iter = 10000,
+  n.burnin = 3000,
+  n.thin = 2
+)
+```
+
+The following plot provides a visual comparison of the fit of the two competing models—the Gamma and the Log-Normal—against the observed data.
+By overlaying the density estimates of the actual data with those generated from the posterior predictive distributions of both models, we can assess how well each model captures the underlying distribution of away goals per match.
+
+The grey area represents the empirical data distribution, while the blue and red areas correspond to the Gamma and Log-Normal model predictions, respectively.
+This visual comparison helps to highlight similarities and differences in model fit, illustrating which model better aligns with the observed data's shape and spread.
+
+```{r}
+# Visual comparison of model fits to the data
+pred_gamma <- rgamma(1000, shape = posterior_means$nu, rate = posterior_means$nu/posterior_means$mu)
+pred_lnorm <- rlnorm(1000, meanlog = fit_ln$BUGSoutput$mean$mu_log, sdlog = fit_ln$BUGSoutput$mean$sigma)
+```
+
+```{r, echo=FALSE}
+# Combine all data into one dataframe for better ggplot handling
+comparison_df <- data.frame(
+  value = c(away_goals_data$AwayGoalsPerMatch, pred_gamma, pred_lnorm),
+  Source = factor(
+    rep(c("Observed Data", "Gamma Posterior Predictive", "Log-Normal Posterior Predictive"),
+        times = c(length(away_goals_data$AwayGoalsPerMatch), length(pred_gamma), length(pred_lnorm)))
+  )
+)
+
+# Plot
+ggplot(comparison_df, aes(x = value, fill = Source, color = Source)) +
+  geom_density(alpha = 0.4, size = 1) +
+  labs(
+    title = "Posterior Predictive Check: Gamma vs Log-Normal",
+    x = "Goals per Match",
+    y = "Density"
+  ) +
+  scale_fill_manual(values = c("Observed Data" = "grey70", "Gamma Posterior Predictive" = "#56B4E9", "Log-Normal Posterior Predictive" = "#E69F00")) +
+  scale_color_manual(values = c("Observed Data" = "grey40", "Gamma Posterior Predictive" = "#1E90FF", "Log-Normal Posterior Predictive" = "#D55E00")) +
+  theme_minimal() +
+  theme(legend.position = "top")
+
+
+```
+
+## 4.3 Comparision of the Point Estimates
+
+Following the Bayesian model fitting, it is essential to compare the point estimates derived from the Log-Normal model with those obtained from the original Gamma model.
+Such a comparison helps evaluate the consistency and robustness of the parameter estimates across different modeling assumptions.
+By examining how closely the estimated means, variances, and coefficients of variation align, we gain insight into the sensitivity of our conclusions to the choice of distribution.
+This step strengthens the credibility of the analysis by ensuring that the key inferential results are not artifacts of a specific model but hold under reasonable alternative formulations.
+
+```{r, echo=FALSE}
+
+comparison_table <- data.frame(
+  Quantità = c("Pop. Average", "Pop.variance", "relative difference"),
+  Gamma = c(posterior_means$mu, posterior_means$sigma2, posterior_means$cv),
+  LogNormal = c(fit_ln$BUGSoutput$mean$mean_lognormal, 
+                fit_ln$BUGSoutput$mean$var_lognormal, 
+                fit_ln$BUGSoutput$mean$cv_lognormal),
+  relative_difference = NA
+)
+
+comparison_table$relative_difference <- 
+  abs(comparison_table$Gamma - comparison_table$LogNormal) / comparison_table$Gamma * 100
+
+comparison_table_numeric <- round(comparison_table[ , -1], 4)
+comparison_table_rounded <- data.frame(Quantità = comparison_table$Quantità, comparison_table_numeric)
+print(comparison_table_rounded)
+```
+
+-   The means estimated by the two models are very close, with the Log-Normal mean (1.0858) slightly higher than the Gamma mean (1.0823).
+    The relative difference is only about 0.29%, indicating strong agreement between the models on the average number of goals per match.
+
+-   The variance estimates show a larger relative difference: the Log-Normal variance (0.1377) is about 14.11% higher than the Gamma variance (0.1206).
+    This suggests that the Log-Normal model captures slightly more variability in the data.
+
+-   Similarly, the coefficient of variation (CV) from the Log-Normal model (0.3414) is approximately 6.46% higher than the Gamma model’s CV (0.3206), reinforcing the notion of increased relative dispersion under the Log-Normal assumption.
+
+Overall, these results indicate that while the two models yield very similar central tendency estimates, the Log-Normal model implies a somewhat greater variability and dispersion in the underlying data.
+This highlights the importance of model choice in capturing uncertainty and suggests that the Log-Normal might be more flexible in representing heterogeneity in goals scored.
+
+## 4.4 Deviance Information Criterion (DIC)
+
+While the point estimates suggest a slight preference for the Log-Normal model due to its higher variance and coefficient of variation, relying solely on these estimates can be misleading.
+To more rigorously compare the Gamma and Log-Normal models, it is essential to consider a model selection criterion that balances model fit and complexity.
+
+The Deviance Information Criterion (DIC) is a widely used Bayesian metric for model comparison.
+It combines a measure of goodness-of-fit with a penalty for model complexity, helping to prevent overfitting.
+A lower DIC value generally indicates a better trade-off between fit and parsimony, thus pointing to a more appropriate model for the data.
+
+The Deviance Information Criterion (DIC) is defined as:
+
+$$
+\text{DIC} = \bar{D} + p_D
+$$
+
+where:
+
+-   $\bar{D}$ is the mean deviance (a measure of model fit),
+-   $p_D$ is the penalty for model complexity (effective number of parameters).
+
+Next, we will compute the DIC values for both models, show the relevant code, and interpret the results to determine which model is more supported by the data.
+
+```{r}
+# Extract DIC from the models
+dic_gamma <- jags_fit$BUGSoutput$DIC
+dic_lognormal <- fit_ln$BUGSoutput$DIC
+
+# Comparative DIC table
+dic_table <- data.frame(
+  Model = c("Gamma", "Log-Normal"),
+  DIC = c(dic_gamma, dic_lognormal),
+  Delta_DIC = c(0, dic_lognormal - dic_gamma)
+)
+
+print(dic_table)
+```
+
+```{r, echo=FALSE}
+# Interpretation
+if (abs(dic_table$Delta_DIC[2]) < 2) {
+  interpretation <- "Negligible difference - models are equivalent"
+} else if (abs(dic_table$Delta_DIC[2]) < 7) {
+  interpretation <- "Substantial difference - moderate preference"
+} else {
+  interpretation <- "Marked difference - strong preference"
+}
+
+cat("DIC Interpretation:", interpretation, "\n")
+if (dic_table$Delta_DIC[2] < 0) {
+  cat("The Log-Normal model is preferred\n")
+} else {
+  cat("The Gamma model is preferred\n")
+}
+```
+
+The DIC values for the two models indicate a clear preference for the Gamma model.
+Specifically, the Gamma model has a DIC of approximately 286.56, while the Log-Normal model has a higher DIC of about 300.15.
+The difference in DIC (ΔDIC) is roughly 13.58, which is considered a substantial difference.
+
+Since a lower DIC indicates a better balance between model fit and complexity, these results suggest that the Gamma model provides a better overall fit to the data compared to the Log-Normal model.
+The relatively large ΔDIC value strengthens the evidence in favor of the Gamma model as the preferred choice.
+
+## 4.5 Marginal Likelihood Comparison
+
+### Harmonic Mean Approximation
+
+An important aspect of Bayesian model comparison involves evaluating the *marginal likelihood* (also known as the model evidence), which represents the probability of the observed data under a given model, integrating over all possible parameter values.
+The marginal likelihood is defined as:
+
+$$
+p(\text{data} \mid \mathcal{M}) = \int p(\text{data} \mid \theta, \mathcal{M}) p(\theta \mid \mathcal{M}) \, d\theta
+$$
+
+Comparing marginal likelihoods allows us to assess which model is more supported by the data, while automatically accounting for model complexity through the integration over the parameter space.
+This forms the basis for computing Bayes Factors, which quantify the strength of evidence in favor of one model over another.
+
+Since exact computation of marginal likelihoods is often analytically intractable, we can use an approximation technique known as the **harmonic mean estimator**.
+This method leverages the identity:
+
+$$
+p(\text{data} \mid \mathcal{M})^{-1} = \mathbb{E}_{\theta \sim p(\theta \mid \text{data})} \left[ \frac{1}{p(\text{data} \mid \theta)} \right]
+$$
+
+This implies that the marginal likelihood can be approximated as the **inverse of the average of the reciprocal of the likelihoods, evaluated over posterior samples**.
+Despite its simplicity, the harmonic mean estimator can be unstable and sensitive to extreme values, but it remains a commonly used heuristic for initial model comparison.
+
+In the following section, we implement this approximation to compare the Gamma and Log-Normal models.
+
+```{r}
+# Function to compute marginal likelihood using the harmonic mean method
+harmonic_mean_marginal <- function(log_likelihood_samples) {
+  # Numerical stabilization
+  max_ll <- max(log_likelihood_samples)
+  exp_diff <- exp(log_likelihood_samples - max_ll)
+  harmonic_mean <- length(log_likelihood_samples) / sum(1 / exp_diff)
+  return(max_ll + log(harmonic_mean))
+}
+
+# Log-likelihood computation for the Gamma model
+log_lik_gamma <- function(params, data) {
+  alpha <- params[1]
+  beta <- params[2]
+  sum(dgamma(data, shape = alpha, rate = beta, log = TRUE))
+}
+
+# Log-likelihood computation for the Log-Normal model
+log_lik_lognormal <- function(params, data) {
+  mu <- params[1]
+  sigma2 <- params[2]
+  sum(dlnorm(data, meanlog = mu, sdlog = sqrt(sigma2), log = TRUE))
+}
+
+# Extract MCMC samples for both models
+gamma_samples <- as.matrix(as.mcmc(jags_fit))
+lognormal_samples <- as.matrix(as.mcmc(fit_ln))
+
+# Convert Gamma parameters: mu and nu --> alpha and beta
+gamma_params <- cbind(gamma_samples[, "nu"], gamma_samples[, "nu"] / gamma_samples[, "mu"])
+
+# Extract parameters for the Log-Normal model: meanlog and variance
+lognormal_params <- cbind(lognormal_samples[, "mu_log"], lognormal_samples[, "sigma"]^2)
+
+# Compute log-likelihoods for each posterior sample
+ll_gamma_samples <- apply(gamma_params, 1, log_lik_gamma, data = away_goals_data$AwayGoalsPerMatch)
+ll_lognormal_samples <- apply(lognormal_params, 1, log_lik_lognormal, data = away_goals_data$AwayGoalsPerMatch)
+
+# Estimate marginal log-likelihoods using the harmonic mean approximation
+log_ml_gamma <- harmonic_mean_marginal(ll_gamma_samples)
+log_ml_lognormal <- harmonic_mean_marginal(ll_lognormal_samples)
+
+# Bayes Factor: compare Gamma against Log-Normal
+log_bf <- log_ml_gamma - log_ml_lognormal
+bf_gamma_vs_lognormal <- exp(log_bf)
+```
+
+```{r,echo=FALSE}
+# Display results
+cat("Marginal Log-Likelihood (Gamma):", round(log_ml_gamma, 2), "\n")
+cat("Marginal Log-Likelihood (Log-Normal):", round(log_ml_lognormal, 2), "\n")
+cat("Log Bayes Factor (Gamma vs Log-Normal):", round(log_bf, 2), "\n")
+cat("Bayes Factor:", round(bf_gamma_vs_lognormal, 2), "\n")
+
+# Interpretation of Bayes Factor (Kass & Raftery scale)
+if (abs(log_bf) < 1) {
+  bf_interpretation <- "Weak evidence"
+} else if (abs(log_bf) < 3) {
+  bf_interpretation <- "Moderate evidence"
+} else if (abs(log_bf) < 5) {
+  bf_interpretation <- "Strong evidence"
+} else {
+  bf_interpretation <- "Very strong evidence"
+}
+
+cat("Interpretation:", bf_interpretation, "\n")
+```
+
+The marginal log-likelihood for the Gamma model is **-143.8**, while for the Log-Normal model it is **-150.35**.
+This results in a log Bayes Factor of **6.55** in favor of the Gamma model.
+When exponentiated, this corresponds to a Bayes Factor of approximately **698.53**, indicating that the data are over 700 times more likely under the Gamma model than under the Log-Normal model.
+
+According to the Kass and Raftery scale, this constitutes **very strong evidence** in favor of the Gamma model.
+While the Log-Normal model provided reasonable point estimates, this result suggests that, when accounting for both model fit and complexity, the Gamma model offers a significantly better explanation of the observed data.
+
+# 5 MCMC Convergence Diagnostics and Error Control
+
+To ensure reliable Bayesian inference, we assessed MCMC convergence using both numerical and graphical diagnostics.
+The Gelman-Rubin statistic (R̂), trace plots, autocorrelation, and running means confirmed good mixing and stability.
+High effective sample sizes and low Monte Carlo errors further validated the precision of the Gamma model estimates.
+
+The validity of Bayesian inferences obtained via MCMC critically depends on the convergence of the Markov chains to the target posterior distribution.
+Inadequate diagnostics can lead to erroneous inferential conclusions, making a systematic analysis of convergence and control of simulation errors essential.
+
+Before proceeding with convergence diagnostics, we report the configuration used for the analysis:
+
+```{r}
+mcmc_config <- list(
+  n_chains = 3,           # Number of parallel chains
+  n_iter = 10000,         # Total iterations per chain
+  n_burnin = 3000,        # Burn-in period
+  n_thin = 2,             # Thinning interval
+  n_samples = (10000 - 3000) / 2  # Usable samples per chain
+)
+
+total_samples <- mcmc_config$n_chains * 
+  ((mcmc_config$n_iter - mcmc_config$n_burnin) / mcmc_config$n_thin)
+cat("Total amount of samples:", total_samples, "\n")
+
+```
+
+### 5.1 Gelman-Rubin Diagnostic (̂R)
+
+One of the most widely used tools for assessing convergence in Markov Chain Monte Carlo (MCMC) simulations is the Gelman-Rubin diagnostic, commonly denoted as R-hat.
+This diagnostic compares the variance within each MCMC chain to the variance between chains.
+If all chains have converged to the same target posterior distribution, these variances should be approximately equal.
+
+The Gelman-Rubin statistic is particularly useful because it provides a simple numerical summary to assess convergence.
+An R hat value close to **1.00** suggests that the chains have likely converged.
+Conversely, values significantly greater than 1 indicate that more iterations may be needed or that the chains are exploring different regions of the parameter space.
+
+This measure is essential in Bayesian analysis because relying on non-converged chains can lead to biased or incorrect inferences.
+Therefore, routinely checking the R hat values helps ensure the reliability of the posterior estimates derived from the model.
+
+```{r}
+# Conversion to mcmc.list format
+mcmc_gamma <- as.mcmc(jags_fit)
+mcmc_lognormal <- as.mcmc(fit_ln)
+
+# R-hat statistics for the Gamma model
+rhat_gamma <- gelman.diag(mcmc_gamma, multivariate = FALSE)
+
+# R-hat statistics for the Log-Normal model
+rhat_lognormal <- gelman.diag(mcmc_lognormal, multivariate = FALSE)
+
+# Check convergence criterion (R-hat < 1.1)
+gamma_converged <- all(rhat_gamma$psrf[, "Point est."] < 1.1)
+lognormal_converged <- all(rhat_lognormal$psrf[, "Point est."] < 1.1)
+```
+
+```{r, echo=FALSE}
+print("R-hat Statistics - Log-Normal Model:")
+print(rhat_lognormal$psrf)
+print("R-hat Statistics - Gamma Model:")
+print(rhat_gamma$psrf)
+
+cat("Convergence - Log-Normal Model:", ifelse(lognormal_converged, "ACHIEVED", "NOT ACHIEVED"), "\n")
+cat("Convergence - Gamma Model:", ifelse(gamma_converged, "ACHIEVED", "NOT ACHIEVED"), "\n")
+```
+
+Based on the Gelman-Rubin diagnostic results, both models demonstrate excellent convergence.
+
+For the Gamma model, all monitored parameters—such as mu, nu and others—have R-hat values extremely close to 1 (e.g., 1.0001–1.0015), indicating that the MCMC chains have likely converged well to the target posterior distribution.
+The fact that all Point est.
+values are well below the 1.1 threshold provides strong reassurance about the stability and reliability of the posterior estimates.
+
+These results confirm that the Markov chains for the Gamma model have converged and that the posterior estimates derived from this model are statistically reliable.
+
+In summary, the convergence diagnostics confirm that the inferences drawn from Gamma model is based on well-behaved, converged MCMC chains, supporting the validity of subsequent interpretations and model comparisons.
+
+## 5.2 Trace Plots, Autocorrelation plots and Running Means.
+
+In Bayesian MCMC analysis, graphical diagnostics such as trace plots, autocorrelation plots, and running means are crucial tools for assessing the quality of the sampled chains.
+
+These diagnostics are especially important in this context, as they provide visual and quantitative evidence that the MCMC algorithms used for the Gamma model is converged properly and that the posterior estimates is reliable.
+Without these checks, inference drawn from the Bayesian models might be questionable due to insufficient mixing or convergence issues.
+
+Trace plots visualize the sampled values of model parameters across iterations, allowing us to observe whether the chains mix well and explore the posterior distribution fully without getting stuck in specific regions.
+
+```{r, fig.width=10, fig.height=5}
+# Extract samples in appropriate format
+gamma_draws <- as.array(jags_fit$BUGSoutput$sims.array)
+
+# Trace plots for main parameters - Gamma Model
+mcmc_trace(gamma_draws, pars = c("nu", "mu", "cv")) +
+  ggtitle("Trace Plots - Gamma Model") +
+  theme_minimal()
+```
+
+The trace plots for the parameters $\nu$, $\mu$, and CV indicate good convergence and mixing of the MCMC chains.
+Each parameter shows stable fluctuations around a consistent central value without any visible trends or drifts.
+The chains overlap well, suggesting effective exploration of the parameter space and reliable sampling.
+Overall, these plots confirm that the MCMC sampling for the Gamma model has successfully converged, providing trustworthy posterior estimates for inference.
+
+Autocorrelation plots measure the correlation of parameter samples with their lagged values within a chain.
+High autocorrelation implies that successive samples are highly dependent, reducing the effective sample size and the precision of estimates.
+Low autocorrelation is desirable as it means samples provide more independent information.
+
+```{r}
+# Autocorrelation plots
+mcmc_acf(gamma_draws, pars = c("nu", "mu", "cv")) +
+  ggtitle("Autocorrelation Functions - Gamma Model")
+```
+
+The autocorrelation plots for the Gamma model parameters ($\nu$, $\mu$, and CV) reveal a rapid decline to near zero after the first lag, indicating low autocorrelation and good mixing of the MCMC chains.
+This pattern suggests that samples become largely independent quickly, enhancing sampling efficiency.
+Consistent behavior across chains and parameters supports effective convergence, reducing the need for long burn-in or heavy thinning.
+Overall, these results confirm that the MCMC sampler produces reliable, independent samples, essential for robust Bayesian inference.
+
+Running mean plots track the cumulative average of the samples over iterations.
+Stable running means that level off indicate that the chain has likely converged to a stable distribution, reinforcing confidence in the estimated parameters.
+
+```{r, fig.width=10, fig.height=5}
+par(mfrow = c(1,3))
+# Running means to evaluate stability
+mcmc_running_mean <- function(x) {
+  cumsum(x) / seq_along(x)
+}
+
+# Plot running means
+gamma_samples_combined <- do.call(rbind, mcmc_gamma)
+running_means <- apply(gamma_samples_combined, 2, mcmc_running_mean)
+
+for(param in c("nu", "mu", "cv")) {
+  if(param %in% colnames(running_means)) {
+    plot(running_means[, param], type = "l", 
+         main = paste("Running Mean -", param),
+         xlab = "Iteration", ylab = "Running Mean")
+    abline(h = mean(gamma_samples_combined[, param]), col = "red", lty = 2)
+  }
+}
+par(mfrow = c(1,1))
+```
+
+The running mean plots for the Gamma model parameters ($\nu$, $\mu$, and CV) demonstrate stable convergence of the MCMC chains.
+Initially, there are minor fluctuations, but each parameter’s running mean quickly stabilizes around its final estimate, indicating that the chains have reached stationarity.
+The smooth trajectories and lack of drift confirm rapid convergence and reliable exploration of the parameter space.
+Overall, these plots provide strong visual evidence that the MCMC sampler produces stable and dependable parameter estimates.
+
+## 5.3 Effective Sample Size (ESS)
+
+Effective Sample Size (ESS) is a key diagnostic metric in Markov Chain Monte Carlo (MCMC) analyses that quantifies the number of independent samples equivalent to the correlated samples obtained from the chains.
+Because MCMC samples are often autocorrelated, the raw number of iterations can overestimate the true amount of independent information.
+
+ESS helps assess the quality and efficiency of the sampling process by indicating how much independent information the posterior sample contains.
+A higher ESS implies better mixing and more reliable parameter estimates, whereas a low ESS suggests that the chain is highly autocorrelated and may require longer runs or improved sampling strategies.
+
+The ESS for a parameter is typically calculated as:
+
+$$
+\text{ESS} = \frac{N}{1 + 2 \sum_{k=1}^{\infty} \rho_k}
+$$
+
+where:
+
+-   $N$ is the total number of MCMC samples,
+-   $\rho_k$ is the autocorrelation at lag $k$.
+
+In practice, the summation is truncated at a lag where the autocorrelations become negligible.
+
+In this context, evaluating the ESS is crucial to ensure that the MCMC chains provide sufficiently independent samples for robust Bayesian inference, supporting confidence in the posterior estimates and subsequent conclusions.
+
+```{r}
+# Calculate Effective Sample Size (ESS) for Gamma model parameters
+ess_gamma <- effectiveSize(mcmc_gamma)
+```
+
+```{r,echo=FALSE}
+# Print the ESS table
+print(ess_gamma)
+```
+
+The Effective Sample Size (ESS) values for the Gamma model parameters - cv, deviance, $\mu$, $\nu$, and $\sigma^2$ - are all very high, ranging from approximately 11,060 to 13,490.
+
+These large ESS values indicate that the Markov Chain Monte Carlo (MCMC) samples are effectively independent, reflecting excellent mixing and low autocorrelation in the chains.
+Consequently, the posterior estimates based on these samples are reliable and robust, providing strong confidence in the inference drawn from the Gamma model.
+
+## 5.4 Monte Carlo Error
+
+When performing Bayesian inference via Markov Chain Monte Carlo (MCMC), it is important to quantify the uncertainty not only in the parameter estimates but also in the estimation process itself.
+One crucial diagnostic is the **Monte Carlo error (MC error)**, which measures the variability in the estimate due to the finite number of MCMC samples.
+MC error helps assess whether the posterior summaries, such as means, are stable or if more samples might be needed to improve precision.
+
+The MC error is typically computed as the **standard error of the sample mean**, adjusted for autocorrelation in the chain by using the **effective sample size (ESS)** rather than the raw number of iterations.
+
+In this analysis, the MC error is calculated for key parameters of the Gamma model (`nu`, `mu`, and `cv`).
+Along with the absolute MC error, the **relative MC error** (as a percentage of the mean) is reported, providing a scale-free measure of precision.
+A relative MC error below 1% is commonly accepted as indicating sufficient precision for reliable inference.
+
+```{r}
+# Function to calculate Monte Carlo error
+mc_error <- function(samples) {
+  n_eff <- effectiveSize(samples)
+  se <- sd(samples) / sqrt(n_eff)
+  return(se)
+}
+
+# Calculate MC errors for main parameters
+gamma_samples_matrix <- as.matrix(mcmc_gamma)
+params_interest <- c("nu", "mu", "cv")
+
+mc_errors_gamma <- sapply(params_interest, function(p) {
+  if(p %in% colnames(gamma_samples_matrix)) {
+    mc_error(gamma_samples_matrix[, p])
+  } else NA
+})
+
+```
+
+```{r,echo=FALSE}
+# Create a table of MC errors
+mc_error_table <- data.frame(
+  Parameter = params_interest,
+  Mean_Gamma = sapply(params_interest, function(p) 
+    if(p %in% colnames(gamma_samples_matrix)) mean(gamma_samples_matrix[, p]) else NA),
+  MC_Error_Gamma = mc_errors_gamma,
+  Relative_MC_Error_Gamma = abs(mc_errors_gamma / sapply(params_interest, function(p) 
+    if(p %in% colnames(gamma_samples_matrix)) mean(gamma_samples_matrix[, p]) else NA)) * 100
+)
+
+print(mc_error_table)
+
+# Check precision criterion (relative MC error < 1%)
+precision_adequate <- all(mc_error_table$Relative_MC_Error_Gamma < 1, na.rm = TRUE)
+cat("Monte Carlo precision adequate (< 1%):", 
+    ifelse(precision_adequate, "YES", "NO"), "\n")
+```
+
+The table shows the Monte Carlo errors and relative errors for the Gamma model parameters $\nu$, $\mu$, and cv.
+All relative MC errors are well below the 1% threshold (0.06%, 0.013%, and 0.029% respectively), indicating very precise estimates.
+
+The final message confirms that the Monte Carlo precision is adequate, meaning the MCMC sampling has produced stable and reliable estimates for these parameters.
+Consequently, there is no immediate need to increase the number of iterations for improving estimate accuracy.
+
+This diagnostic strengthens confidence in the inference results from the Gamma model.
+
+# EXTRA: Model Validation Through Parameter Recovery via Simulation
+
+To validate our Bayesian model, we conducted a parameter recovery study using simulated data.
+This approach tests whether the model can accurately recover known parameters when applied to synthetic data generated from a Gamma distribution with pre-defined values.
+Successfully recovering the parameters confirms the correctness of the model implementation, the adequacy of the priors, and the model's responsiveness to the data.
+
+We simulated data based on true values of $\mu$ and $\nu$, fitted the Bayesian model using JAGS, and compared the posterior estimates to the known values.
+Recovery metrics—bias, mean squared error, and 95% coverage—were computed to assess accuracy.
+Results showed excellent recovery for $\mu$ and reasonable performance for $\nu$, with credible intervals capturing the true values in all cases.
+
+This strengthens confidence in our model's reliability for real-world inference.
+
+#### Purpose and Methodology
+
+To assess the reliability and robustness of our Bayesian model, we perform a **parameter recovery study using simulated data**.
+This approach involves generating synthetic data from a known distribution with pre-specified parameter values and then applying the Bayesian inference procedure to evaluate whether the model is capable of recovering those true parameters.
+
+This procedure serves multiple purposes:
+
+-   **Model Implementation Verification**: It helps ensure that the model has been coded and specified correctly.
+    If the model cannot retrieve parameters it was simulated from, a flaw in the implementation is likely.
+
+-   **Prior Distribution Assessment**: It allows for evaluating whether the chosen prior distributions are appropriate or unduly informative, by observing how much they influence the posterior estimates relative to the data.
+
+-   **Sensitivity to Data**: The recovery process highlights the model’s responsiveness to the data and its ability to extract meaningful information, especially under realistic sample sizes and noise levels.
+
+If the Bayesian analysis successfully recovers the true parameters within a reasonable range (typically the 95% credible intervals), it builds confidence in the validity and applicability of the model to real-world data.
+
+#### Overview of the Procedure
+
+1.  **Definition of True Parameters**\
+    We start by specifying the "true" values for the parameters of interest, in this case $\mu$ (mean) and $\nu$ (shape).
+    These values are typically chosen based on prior estimates or plausible values observed in real data.
+    The true variance `σ²` is then derived from the Gamma distribution's properties.
+
+2.  **Simulated Data Generation**\
+    Using the known parameters, we generate synthetic observations from a Gamma distribution.
+    This simulated dataset represents a known ground truth, serving as a controlled environment to test the model's performance.
+
+3.  **Bayesian Inference on Simulated Data**\
+    We fit the Bayesian model to the simulated data using JAGS, specifying prior distributions and MCMC settings as done with real data.
+    This yields posterior samples for each parameter.
+
+4.  **Extraction of Posterior Estimates**\
+    From the MCMC output, we extract samples for key parameters such as $\mu$ and $\nu$.
+    These samples are then used to compute summary statistics and uncertainty estimates.
+
+5.  **Recovery Metrics Computation**\
+    To assess the model’s recovery ability, we compute the following metrics:
+
+    -   **Bias**: the average difference between estimated and true values
+    -   **Mean Squared Error (MSE)**: a measure of estimation precision
+    -   **Coverage**: the proportion of simulations where the 95% credible interval contains the true value
+
+```{r, results='hide'}
+# True parameters based on previous analysis
+mu_true <- 1.082
+nu_true <- 9.76
+sigma2_true <- mu_true^2 / nu_true
+
+# Sample size equal to the original dataset
+n_sim <- nrow(away_goals_data)
+
+# Simulating data from the Gamma distribution
+simulated_data <- rgamma(
+  n_sim, 
+  shape = nu_true, 
+  rate = nu_true / mu_true
+)
+
+# Function to perform Bayesian analysis on the simulated data
+analyze_simulated_data <- function(y, a_mu, b_mu, a_nu, b_nu) {
+  data_list_sim <- list(
+    y = y,
+    n = length(y),
+    a_mu = 1.5,
+    b_mu = 1.38637,
+    a_nu = 2,
+    b_nu = 0.204551 
+  )
+  
+  fit_sim <- jags(
+    data = data_list_sim,
+    parameters.to.save = c("mu", "nu", "sigma2", "cv"),
+    model.file = textConnection(model_string),
+    n.chains = 3,           
+    n.iter = 10000,        
+    n.burnin = 3000,      
+    n.thin = 2   
+  )
+  return(fit_sim$BUGSoutput)
+}
+
+# Running the Bayesian analysis on the simulated dataset
+results_sim <- analyze_simulated_data(simulated_data)
+
+# Function to compute evaluation metrics for parameter recovery
+calculate_recovery_metrics <- function(true, estimated) {
+  list(
+    bias = mean(estimated) - true,
+    mse = mean((estimated - true)^2),
+    coverage_95 = mean(true > quantile(estimated, 0.025) & true < quantile(estimated, 0.975))
+  )
+}
+
+# Extracting posterior samples for mu and nu
+mu_est <- results_sim$sims.list$mu
+nu_est <- results_sim$sims.list$nu
+
+# Computing recovery metrics
+metrics_mu <- calculate_recovery_metrics(mu_true, mu_est)
+metrics_nu <- calculate_recovery_metrics(nu_true, nu_est)
+
+```
+
+```{r,echo=FALSE}
+print(metrics_mu)
+print(metrics_nu)
+```
+
+The analysis of the Bayesian parameter recovery results reveals important insights about how well the model estimates the true values of $\mu$ and $\nu$ (nu) from the simulated data.
+
+For the parameter $\mu$, the bias is very small and negative (-0.027), indicating that the model's estimates tend to slightly underestimate the true value.
+However, this bias is minimal and accompanied by a low mean squared error (MSE), which reflects good precision in the estimates.
+Moreover, the 95% credible intervals fully capture the true value in all cases, demonstrating that the uncertainty quantification is reliable and well-calibrated for $\mu$.
+
+On the other hand, the parameter $\nu$ shows a somewhat larger positive bias (about 1.19), meaning the model tends to slightly overestimate this parameter.
+The MSE is also higher than for $\mu$, suggesting that the estimates for $\nu$ are less precise.
+Despite this, the 95% credible intervals still cover the true value 100% of the time, which indicates that although the point estimates may be biased, the overall uncertainty around $\nu$ is properly accounted for.
+
+In summary, the Bayesian model does an excellent job recovering both parameters from simulated data.
+While the estimates for $\nu$ exhibit a bit more variability and bias compared to $\mu$, the credible intervals remain robust and capture the true values effectively.
+This gives us confidence that the model is well calibrated and capable of providing accurate and trustworthy inference when applied to real data.
+
+# EXTRA: Comparative Analysis with Frequentist Inference
+
+We compared Bayesian estimates with frequentist ones obtained via maximum likelihood to check consistency.
+Both approaches yielded very similar values for $\mu$ and $\nu$, with overlapping uncertainty intervals.
+This confirms that our Bayesian model is robust and its results are well supported by the data, not overly influenced by prior assumptions.
+
+Comparing Bayesian inference with frequentist methods is a crucial step in validating and understanding the strengths and limitations of our statistical modeling approach.
+Frequentist inference provides point estimates and confidence intervals based solely on the likelihood function, without incorporating prior information.
+This can offer a valuable baseline for comparison, helping to assess the influence and contribution of prior beliefs in Bayesian analysis.
+
+One of the main advantages of frequentist methods lies in their computational simplicity and well-established theoretical properties, which often make them more straightforward to implement and interpret, especially in cases with large sample sizes or well-behaved likelihoods.
+Conversely, Bayesian inference allows for a more flexible and coherent framework that can integrate prior knowledge and quantify uncertainty more comprehensively through posterior distributions.
+
+In our case, the frequentist analysis was applied by fitting parametric distributions to the observed data using the `fitdist` function, which estimates parameters via maximum likelihood.
+These estimates served as an essential guide for specifying the prior distributions of the Bayesian model parameters, namely $\mu$ and $\nu$.
+By anchoring the priors on frequentist estimates, we aimed to balance the incorporation of prior knowledge with empirical data, thereby enhancing the robustness and interpretability of our Bayesian inference.
+
+This strategy allows us to leverage the strengths of both paradigms: using frequentist estimates to inform reasonable prior settings, while employing Bayesian methods to fully characterize parameter uncertainty and model complexity.
+The following sections will detail the implementation of this approach and present the comparative results.
+
+A classical frequentist approach is used to estimate the Gamma distribution parameters (`shape` and `rate`) through maximum likelihood estimation with the `fitdist` function.
+The key parameters, $\mu$ (mean) and $\nu$ (shape), are computed as `shape/rate` and `shape` respectively.
+Approximate 95% confidence intervals are then constructed using the normal approximation formula.
+This step returns point estimates and confidence intervals for $\mu$ and $\nu$.
+
+The frequentist method is applied directly to the observed data (e.g., "Away Goals per Match") to obtain parameter estimates and confidence intervals based on the empirical information.
+
+From the Bayesian model fitted with MCMC (e.g., using JAGS), the posterior means of $\mu$ and $\nu$ are extracted alongside their 95% credible intervals.
+These represent the Bayesian point estimates and uncertainty intervals based on the posterior distributions.
+
+```{r}
+frequentist_analysis <- function(data) {
+  # Maximum Likelihood Estimation (MLE)
+  fit_mle <- fitdistr(data, "gamma")
+  shape_mle <- fit_mle$estimate["shape"]
+  rate_mle <- fit_mle$estimate["rate"]
+  
+  # Confidence intervals for mu and nu
+  ci_mu <- shape_mle / rate_mle + c(-1, 1) * 1.96 * sqrt(shape_mle) / rate_mle / sqrt(length(data))
+  ci_nu <- shape_mle + c(-1, 1) * 1.96 * sqrt(shape_mle) / sqrt(length(data))
+  
+  return(list(
+    mu_estimate = shape_mle / rate_mle,
+    mu_ci = ci_mu,
+    nu_estimate = shape_mle,
+    nu_ci = ci_nu
+  ))
+}
+
+# Apply to original dataset
+freq_results <- frequentist_analysis(away_goals_data$AwayGoalsPerMatch)
+
+# Extract Bayesian estimates and credible intervals
+bayes_mu_mean <- jags_fit$BUGSoutput$mean$mu
+bayes_nu_mean <- jags_fit$BUGSoutput$mean$nu
+
+bayes_mu_ci <- paste0(
+  round(jags_fit$BUGSoutput$summary["mu", "2.5%"], 3), " - ",
+  round(jags_fit$BUGSoutput$summary["mu", "97.5%"], 3)
+)
+
+bayes_nu_ci <- paste0(
+  round(jags_fit$BUGSoutput$summary["nu", "2.5%"], 3), " - ",
+  round(jags_fit$BUGSoutput$summary["nu", "97.5%"], 3)
+)
+
+```
+
+```{r,echo=FALSE}
+
+# Construct comparison table without hypothesis test
+comparison_df <- data.frame(
+  Parameter = c("μ", "ν"),
+  Bayes_Estimate = c(bayes_mu_mean, bayes_nu_mean),
+  Bayes_CI95 = c(bayes_mu_ci, bayes_nu_ci),
+  Frequentist_Estimate = c(freq_results$mu_estimate, freq_results$nu_estimate),
+  Frequentist_CI95 = c(
+    paste0(round(freq_results$mu_ci[1], 3), " - ", round(freq_results$mu_ci[2], 3)),
+    paste0(round(freq_results$nu_ci[1], 3), " - ", round(freq_results$nu_ci[2], 3))
+  )
+)
+
+print(comparison_df)
+```
+
+The parameter estimates from both Bayesian and frequentist approaches are remarkably consistent.
+For the mean parameter $\mu$, the point estimates are nearly identical (1.0823 vs. 1.0820), and their 95% credible and confidence intervals overlap substantially, indicating strong agreement in the estimation of this parameter.
+
+For the shape parameter $\nu$, the estimates are also very close (9.76 vs. 9.78).
+Although the Bayesian credible interval (8.52 - 11.09) is slightly wider than the frequentist confidence interval (9.49 - 10.07), there is still significant overlap, suggesting both methods identify a similar plausible range for $\nu$.
+
+Overall, these results suggest that both inference methods yield consistent parameter estimates for the Gamma distribution in this context, reinforcing the robustness of the findings.
+
+# Conclusion
+
+This comprehensive analysis of away goals performance in Serie A has yielded robust insights through a Bayesian statistical framework.
+The Gamma distribution emerged as the optimal model for characterizing away goals per match, outperforming the Log-Normal alternative based on both DIC (ΔDIC = 13.58) and Bayes Factor (BF = 698.53) metrics.
+Our findings establish that the expected number of away goals per match is 1.08 (95% CI: 1.05-1.12), with a precision parameter of 9.76 (95% CI: 8.52-11.09) indicating moderate consistency in team performances away from home.
+
+The convergence diagnostics and parameter recovery studies confirmed the reliability of our inferences, with all R hat statistics ≤ 1.0015 and Monte Carlo errors \< 0.06%.
+Notably, the comparison with frequentist methods revealed remarkable consistency in point estimates while highlighting Bayesian advantages in uncertainty quantification.
+The stability of away goals performance across seasons suggests fundamental characteristics of Serie A's competitive structure, though the exclusion of the anomalous 2016/2017 season was justified by our sensitivity analysis.
+
+This study demonstrates the value of Bayesian approaches for sports analytics, providing not only point estimates but complete posterior distributions that properly quantify uncertainty.
+Future research could extend this framework to model home advantage dynamics, investigate temporal trends more granularly, or incorporate team-level hierarchical effects.
+The methodological rigor established here serves as a foundation for more sophisticated models of football performance that account for tactical evolution and competitive balance in one of Europe's most strategically complex leagues.
