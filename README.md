@@ -36,8 +36,8 @@ Our investigation employs a rigorous Bayesian framework to model the average awa
 
  ## Repository Contents
 
-- `Sorrentini_2023085.Rmd/` – Scripts for original and optimized SQL queries.
-- `SerieA.Rdata/` – Original CSV files used (`listings.csv`, `reviews.csv`, `calendar.csv`).
+- `Sorrentini_2023085.Rmd` – Scripts for the analysis.
+- `SerieA.RData` – Original file used.
 - `progetto.pdf` – Final report including description, analysis.
 - `README.md` – This file.
 
