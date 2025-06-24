@@ -34,6 +34,14 @@ Our investigation employs a rigorous Bayesian framework to model the average awa
 4.  **Model Comparison**: Formal comparison of Gamma and Log-Normal alternatives\
 5.  **Validation**: MCMC diagnostics, parameter recovery, and frequentist benchmarking
 
+ ## Repository Contents
+
+- `Sorrentini_2023085.Rmd/` – Scripts for original and optimized SQL queries.
+- `SerieA.Rdata/` – Original CSV files used (`listings.csv`, `reviews.csv`, `calendar.csv`).
+- `progetto.pdf` – Final report including description, analysis.
+- `README.md` – This file.
+
+
 ## Conclusion
 
 This comprehensive analysis of away goals performance in Serie A has yielded robust insights through a Bayesian statistical framework.
@@ -43,6 +51,16 @@ Our findings establish that the expected number of away goals per match is 1.08 
 The convergence diagnostics and parameter recovery studies confirmed the reliability of our inferences, with all R hat statistics ≤ 1.0015 and Monte Carlo errors \< 0.06%.
 Notably, the comparison with frequentist methods revealed remarkable consistency in point estimates while highlighting Bayesian advantages in uncertainty quantification.
 The stability of away goals performance across seasons suggests fundamental characteristics of Serie A's competitive structure, though the exclusion of the anomalous 2016/2017 season was justified by our sensitivity analysis.
+
+## Contact
+
+**Author**: [Matteo Sorrentini]  
+📧 [sorrentini.2023085@studenti.uniroma1.it](mailto:sorrentini.2023085@studenti.uniroma1.it)
+
+##  License
+
+This project is released under the **MIT License**.  
+See the `LICENSE` file for more details.
 
 This study demonstrates the value of Bayesian approaches for sports analytics, providing not only point estimates but complete posterior distributions that properly quantify uncertainty.
 Future research could extend this framework to model home advantage dynamics, investigate temporal trends more granularly, or incorporate team-level hierarchical effects.
